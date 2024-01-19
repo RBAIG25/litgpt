@@ -3,7 +3,7 @@
 import sys
 import time
 from pathlib import Path
-from typing import Any, Literal, Optional
+from typing import Any, Literal, Optional, Union, List
 
 import lightning as L
 import torch
@@ -28,7 +28,9 @@ def multinomial_num_samples_1(probs: torch.Tensor) -> torch.Tensor:
 
 
 def sample(logits: torch.Tensor, temperature: float = 1.0, top_k: Optional[int] = None) -> torch.Tensor:
-    logits = logits[0, -1]
+
+    logits = logits[:, -1]
+
     # optionally crop the logits to only the top k options
     if top_k is not None:
         v, i = torch.topk(logits, min(top_k, logits.size(-1)))
@@ -46,19 +48,21 @@ def next_token(model: GPT, input_pos: torch.Tensor, x: torch.Tensor, **kwargs: A
     next = sample(logits, **kwargs)
     return next.to(dtype=x.dtype)
 
-
 @torch.inference_mode()
 def generate(
     model: GPT,
-    prompt: torch.Tensor,
+    prompts: torch.Tensor,
     max_returned_tokens: int,
     *,
     temperature: float = 1.0,
     top_k: Optional[int] = None,
     eos_id: Optional[int] = None,
 ) -> torch.Tensor:
+    
     """Takes a conditioning sequence (prompt) as input and continues to generate as many tokens as requested.
 
+    Is capable of handling batched prompts with left-padding.
+    
     The implementation of this function is modified from A. Karpathy's nanoGPT.
 
     Args:
@@ -69,7 +73,14 @@ def generate(
         top_k: If specified, only sample among the tokens with the k highest probabilities.
         eos_id: If specified, stop generating any more token once the <eos> token is triggered.
     """
-    T = prompt.size(0)
+    
+    # make sure we have a batch dimension
+    if prompts.dim() == 1:
+        prompts = prompts.unsqueeze(0)
+        
+    B = prompts.size(0)
+    T = prompts.size(1)
+    
     assert max_returned_tokens > T
     if model.max_seq_length < max_returned_tokens - 1:
         # rolling the kv cache based on the `input_pos` value would be necessary. However, doing so would introduce a
@@ -77,28 +88,45 @@ def generate(
         # not support it to avoid negatively impacting the overall speed
         raise NotImplementedError(f"max_seq_length {model.max_seq_length} needs to be >= {max_returned_tokens - 1}")
 
-    device = prompt.device
-    tokens = [prompt]
-    input_pos = torch.tensor([T], device=device)
-    token = next_token(
-        model, torch.arange(0, T, device=device), prompt.view(1, -1), temperature=temperature, top_k=top_k
-    ).clone()
-    tokens.append(token)
-    for _ in range(2, max_returned_tokens - T + 1):
-        token = next_token(model, input_pos, token.view(1, -1), temperature=temperature, top_k=top_k).clone()
-        tokens.append(token)
-        if token == eos_id:
+    device = prompts.device
+    dtype = prompts.dtype
+
+    # an outout tensor to fill with generated tokens
+    outputs_tensor = torch.zeros((B, max_returned_tokens), dtype=dtype, device=device)
+    outputs_tensor[:, :T] = prompts
+
+    token = next_token(model, torch.arange(0, T, device=device), prompts, temperature=temperature, top_k=top_k).clone()
+    outputs_tensor[torch.arange(0, B, device=device) , T] = token.squeeze()
+
+    input_position = torch.tensor(T, device=device)
+    finished = torch.tensor([False] * B, device=device)
+    max_generation_iters = max_returned_tokens - T + 1
+
+    for _ in range(2, max_generation_iters):
+
+        token = next_token(model, input_position, token, temperature=temperature, top_k=top_k).clone()
+        outputs_tensor[:, input_position] = token.squeeze()
+        input_position = input_position.add_(1)
+        finished = (token == eos_id).view(-1) | finished
+        
+        if isinstance(finished, bool):
+            finished = torch.tensor([finished] * B, device=device)
+            
+        if finished.all():
+            print("breaking")
             break
-        input_pos = input_pos.add_(1)
-    return torch.cat(tokens)
+    if B == 1:
+        outputs_tensor = outputs_tensor.squeeze(0)
+    return outputs_tensor
+
 
 
 @torch.inference_mode()
 def main(
-    prompt: str = "What food do llamas eat?",
+    prompts: Union[str, List] = "What food do llamas eat??",
     *,
     num_samples: int = 1,
-    max_new_tokens: int = 50,
+    max_new_tokens: int = 100,
     top_k: Optional[int] = 200,
     temperature: float = 0.8,
     checkpoint_dir: Path = Path("checkpoints/stabilityai/stablelm-base-alpha-3b"),
@@ -106,10 +134,11 @@ def main(
     precision: Optional[str] = None,
     compile: bool = False,
 ) -> None:
+    
     """Generates text samples based on a pre-trained model and tokenizer.
 
     Args:
-        prompt: The prompt string to use for generating the samples.
+        prompt: The prompt string or list of prompt strings to use for generating the samples.
         num_samples: The number of text samples to generate.
         max_new_tokens: The number of generation steps to take.
         top_k: The number of top most probable tokens to consider in the sampling process.
@@ -123,6 +152,7 @@ def main(
         precision: Indicates the Fabric precision setting to use.
         compile: Whether to compile the model.
     """
+    
     precision = precision or get_default_supported_precision(training=False)
 
     plugins = None
@@ -142,9 +172,19 @@ def main(
     checkpoint_path = checkpoint_dir / "lit_model.pth"
 
     tokenizer = Tokenizer(checkpoint_dir)
-    encoded = tokenizer.encode(prompt, device=fabric.device)
-    prompt_length = encoded.size(0)
-    max_returned_tokens = prompt_length + max_new_tokens
+    if isinstance(prompts, str):
+        prompts = [prompts]
+
+    # Encode the batched prompts with left padding, using 0 as the padding value
+    encoded = [tokenizer.encode(p, device=fabric.device) for p in prompts]
+    encoded_lengths = torch.tensor([p.size(0) for p in encoded], device=fabric.device)
+    longest_prompt = max(encoded_lengths)
+    encoded = torch.stack([torch.nn.functional.pad(p, (longest_prompt - encoded_lengths[i], 0), value=0) for i, p in enumerate(encoded)], dim=0)
+    
+    B = len(encoded)   
+    T = encoded.size(1)
+    
+    max_returned_tokens = T + max_new_tokens
 
     fabric.print(f"Loading model {str(checkpoint_path)!r} with {config.__dict__}", file=sys.stderr)
     t0 = time.perf_counter()
@@ -155,7 +195,7 @@ def main(
         # set the max_seq_length to limit the memory usage to what we need
         model.max_seq_length = max_returned_tokens
         # enable the kv cache
-        model.set_kv_cache(batch_size=1)
+        model.set_kv_cache(batch_size=B)
     model.eval()
 
     if compile:
@@ -178,11 +218,21 @@ def main(
         t = time.perf_counter() - t0
         for block in model.transformer.h:
             block.attn.kv_cache.reset_parameters()
-        fabric.print(tokenizer.decode(y))
-        tokens_generated = y.size(0) - prompt_length
-        fabric.print(
-            f"Time for inference {i + 1}: {t:.02f} sec total, {tokens_generated / t:.02f} tokens/sec", file=sys.stderr
-        )
+
+        # printing the results
+        if y.dim() == 1:
+            y = y.unsqueeze(0)
+        # a boolean mask to filter out our padding zeroes and the eos tokens as we print
+        padding_mask = (y != 0) & (y != tokenizer.eos_id)
+
+        for b in range(B):
+            fabric.print(f"\n\033[35mOutput # \033[37m{b + 1}:")
+            fabric.print(f"\033[32mTotal tokens: \033[37m{y[b][padding_mask[b]].count_nonzero()}\n")
+            fabric.print(f"\033[37m{tokenizer.decode(y[b][padding_mask[b]])}\n")
+
+        tokens_generated = y[padding_mask].count_nonzero() - encoded_lengths.sum()
+        fabric.print(f"Time for inference {i + 1}: {t:.02f} sec total, {tokens_generated / t:.02f} tokens/sec", file=sys.stderr)
+        
     if fabric.device.type == "cuda":
         fabric.print(f"Memory used: {torch.cuda.max_memory_allocated() / 1e9:.02f} GB", file=sys.stderr)
 
