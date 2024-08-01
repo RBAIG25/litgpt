@@ -26,6 +26,7 @@ from transformers.models.gpt_neox import GPTNeoXConfig, GPTNeoXForCausalLM
 from transformers.models.llama import LlamaConfig, LlamaForCausalLM
 from transformers.models.mistral import MistralConfig, MistralForCausalLM
 from transformers.models.mixtral import MixtralConfig, MixtralForCausalLM
+from transformers.models.olmo import OlmoConfig, OlmoForCausalLM
 
 import litgpt.config as config_module
 from litgpt import GPT, Config
@@ -34,6 +35,7 @@ from litgpt.scripts.convert_hf_checkpoint import (
     copy_weights_gemma_2,
     copy_weights_gpt_neox,
     copy_weights_hf_llama,
+    copy_weights_olmo,
     copy_weights_phi,
 )
 from tests.conftest import RunIf
@@ -477,6 +479,65 @@ def test_against_hf_mixtral():
 
     # test end to end
     x = torch.tensor([[9856, 23, 491, 1536, 304], [23, 345, 65, 123, 321]], dtype=torch.int32, device=device)
+    assert x.size(1) == T
+    ours_y = ours_model(x)
+    theirs_y = theirs_model(x)["logits"].to(dtype)  # HF converts logits to float
+    torch.testing.assert_close(ours_y, theirs_y)
+
+
+@torch.inference_mode()
+@pytest.mark.parametrize("model_name", ("OLMo-1b-hf", "OLMo-7b-hf"))
+@pytest.mark.parametrize(
+    ("device", "dtype"),
+    [
+        (torch.device("cpu"), torch.float32),
+        pytest.param(
+            torch.device("cuda"),
+            torch.float16,
+            marks=[
+                # the reference does softmax upscaled to fp32 during attention. additionally, the final layernorm input
+                # is slightly different
+                pytest.mark.xfail(raises=AssertionError, strict=False),
+                RunIf(min_cuda_gpus=1),
+            ],
+        ),
+    ],
+)
+def test_against_olmo(model_name, device, dtype):
+    torch.set_default_dtype(dtype)
+
+    ours_config = Config.from_name(
+        model_name,
+        padded_vocab_size=10000,
+        n_layer=2,
+        n_head=8,
+        n_embd=32,
+        intermediate_size=86,
+    )
+    T = 5
+    theirs_config = OlmoConfig(
+        vocab_size=ours_config.padded_vocab_size,
+        hidden_size=ours_config.n_embd,
+        intermediate_size=ours_config.intermediate_size,
+        num_hidden_layers=ours_config.n_layer,
+        num_attention_heads=ours_config.n_head,
+        num_key_value_heads=ours_config.n_query_groups,
+        max_positional_embeddings=T,
+        attention_bias=ours_config.bias,
+        rope_theta=ours_config.rope_base,
+        tie_word_embeddings=(model_name == "OLMo-1b-hf"),
+    )
+    assert ours_config.intermediate_size == theirs_config.intermediate_size
+
+    theirs_model = OlmoForCausalLM(theirs_config).to(device)
+    theirs_state_dict = theirs_model.state_dict()
+    state_dict = {}
+    copy_weights_olmo(ours_config, {}, state_dict, theirs_state_dict)
+    ours_model = GPT(ours_config).to(device)
+    ours_model.load_state_dict(state_dict)
+
+    # test end to end
+    x = torch.tensor([[9856, 23, 491, 1536, 304]], dtype=torch.int32, device=device)
     assert x.size(1) == T
     ours_y = ours_model(x)
     theirs_y = theirs_model(x)["logits"].to(dtype)  # HF converts logits to float

@@ -149,12 +149,17 @@ class Config:
     @property
     def norm_class(self) -> Type:
         # `self.norm_class_name` cannot be the type to keep the config serializable
-        if self.norm_class_name == "RMSNorm":
-            from functools import partial
+        from functools import partial
 
+        if self.norm_class_name == "RMSNorm":
             from litgpt.model import RMSNorm
 
             return partial(RMSNorm, add_unit_offset="Gemma" in self.name)
+
+        if self.norm_class_name == "LayerNorm" and "OLMo" in self.name:
+            # this makes it equivalent to `torch.nn.functional.layer_norm`
+            # that is used by OLMo
+            return partial(torch.nn.LayerNorm, elementwise_affine=False)
         return getattr(torch.nn, self.norm_class_name)
 
 
@@ -960,6 +965,62 @@ for c in llama_3:
         copy["hf_config"]["name"] = c["hf_config"]["name"].format(kind)
         configs.append(copy)
 
+#################
+# Allen AI OLMo
+#################
+olmo = [
+    # https://huggingface.co/allenai/OLMo-1B-hf/blob/main/config.json
+    dict(
+        name="OLMo-1b-hf",
+        hf_config=dict(org="allenai", name="OLMo-1b-hf"),
+        vocab_size=50280,
+        padded_vocab_size=50304,
+        block_size=2048,
+        n_embd=2048,
+        n_layer=16,
+        n_head=16,
+        rotary_percentage=1.0,
+        parallel_residual=False,
+        bias=False,
+        norm_class_name="LayerNorm",
+        mlp_class_name="LLaMAMLP",
+        intermediate_size=8192,
+    ),
+    # https://huggingface.co/allenai/OLMo-7B-hf/blob/main/config.json
+    dict(
+        name="OLMo-7b-hf",
+        hf_config=dict(org="allenai", name="OLMo-7b-hf"),
+        vocab_size=50280,
+        padded_vocab_size=50304,
+        block_size=2048,
+        n_layer=32,
+        n_head=32,
+        rotary_percentage=1.0,
+        parallel_residual=False,
+        bias=False,
+        norm_class_name="LayerNorm",
+        mlp_class_name="LLaMAMLP",
+        intermediate_size=11008,
+    ),
+    # https://huggingface.co/allenai/OLMo-7B-Instruct-hf/blob/main/config.json
+    dict(
+        name="OLMo-7b-Instruct-hf",
+        hf_config=dict(org="allenai", name="OLMo-7b-Instruct-hf"),
+        vocab_size=50280,
+        padded_vocab_size=50304,
+        block_size=2048,
+        n_layer=32,
+        n_head=32,
+        rotary_percentage=1.0,
+        parallel_residual=False,
+        bias=False,
+        norm_class_name="LayerNorm",
+        mlp_class_name="LLaMAMLP",
+        intermediate_size=11008,
+    ),
+]
+
+configs.extend(olmo)
 
 ###############
 # Google Gemma
